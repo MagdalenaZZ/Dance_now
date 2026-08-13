@@ -139,7 +139,7 @@ Resources:
         SecurityGroupIds:
           - !Ref BatchSecurityGroup
         Ec2Configuration:
-          - ImageType: ECS_AL2_NVIDIA
+          - ImageType: ECS_AL2023_NVIDIA
         LaunchTemplate:
           LaunchTemplateId: !Ref WorkerLaunchTemplate
           Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
