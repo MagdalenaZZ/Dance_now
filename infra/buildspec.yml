@@ -1,5 +1,12 @@
 version: 0.2
 
+# All of build+smoke-test+push+logout is deliberately kept in one phase.
+# CodeBuild runs post_build even when build fails (it behaves like a
+# `finally` block), so splitting the smoke test into `build` and the push
+# into `post_build` does NOT stop a failed test from still publishing the
+# image — confirmed the hard way. Commands within a single phase, by
+# contrast, stop at the first failure, which is the behavior we actually
+# want: never push an image that failed its smoke test.
 phases:
   pre_build:
     commands:
@@ -11,24 +18,28 @@ phases:
   build:
     commands:
       - docker build --tag "${IMAGE_URI}" .
-      # Smoke test before anything gets published: confirms Python actually
-      # starts, every dependency imports cleanly (torch, the Wan2.2 package,
-      # our own worker.py/dance_now code, boto3, huggingface_hub), and that
-      # the install didn't silently break something. CodeBuild has no GPU,
-      # so this can't confirm CUDA itself works — only that nothing hangs or
-      # crashes on startup, which is the class of failure that's otherwise
-      # invisible until a real (quota-scarce) GPU job mysteriously stalls.
+      # Smoke test before anything gets published: confirms Python starts,
+      # torch/boto3/huggingface_hub actually import, our own worker.py (and
+      # therefore the dance_now package/PYTHONPATH) imports cleanly, and the
+      # wan package is installed and discoverable. This can't call into wan
+      # itself — its modules touch CUDA at import time (e.g.
+      # wan/modules/t5.py calls torch.cuda.current_device() at class
+      # definition), so any `import wan` fails outright on CodeBuild's
+      # GPU-less build host regardless of whether the install is actually
+      # fine. find_spec() confirms it's installed without executing it.
       - >
         docker run --rm --entrypoint python "${IMAGE_URI}" -c
-        "import torch, boto3, huggingface_hub, wan, worker;
-        print('torch', torch.__version__, 'cuda_available:', torch.cuda.is_available());
+        "import importlib.util, torch, boto3, huggingface_hub;
+        assert importlib.util.find_spec('wan') is not None, 'wan package not found';
+        import worker;
+        print('torch', torch.__version__);
         print('SMOKE_TEST_OK')"
-  post_build:
-    commands:
       - docker push "${IMAGE_URI}"
       # Resolve to the immutable content digest so callers can pin to it
       # rather than the mutable tag (a tag can be overwritten later; a
       # digest always refers to this exact, already-reviewed content).
       - DIGEST="$(docker inspect --format='{{index .RepoDigests 0}}' "${IMAGE_URI}")"
       - echo "DANCE_NOW_IMAGE_DIGEST=${DIGEST}"
+  post_build:
+    commands:
       - docker logout
