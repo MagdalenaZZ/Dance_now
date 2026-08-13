@@ -16,7 +16,11 @@ RUN apt-get update \
 
 RUN git clone --depth 1 --branch "${WAN_REF}" https://github.com/Wan-Video/Wan2.2.git /opt/Wan2.2 \
     && pip install -r /opt/Wan2.2/requirements.txt \
-    && pip install "boto3>=1.34,<2" "huggingface_hub>=0.27,<2"
+    # wan/__init__.py unconditionally imports speech2video, which needs
+    # decord -- but upstream's own requirements.txt doesn't list it. Without
+    # this, `import wan` (worker.py) fails at job time even though we only
+    # ever use WanTI2V, not the speech2video pipeline.
+    && pip install decord "boto3>=1.34,<2" "huggingface_hub>=0.27,<2"
 
 COPY pyproject.toml /app/pyproject.toml
 COPY src /app/src
