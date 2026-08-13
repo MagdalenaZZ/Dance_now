@@ -1,0 +1,101 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  One-time setup: builds the Dance Now worker image entirely inside AWS
+  (no local bandwidth involved) and pushes it to a Docker Hub repository.
+  Deploy this once with scripts/deploy_codebuild.sh; it costs nothing while
+  idle (CodeBuild only bills for actual build minutes).
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Existing S3 bucket used to stage the build source (dance-now/codebuild-source/ prefix)
+  DockerHubUsername:
+    Type: String
+    Description: Docker Hub account that owns the destination repository
+  DockerHubRepo:
+    Type: String
+    Default: dance-now-worker
+    Description: Docker Hub repository name (will be pushed to as DockerHubUsername/DockerHubRepo)
+  DockerHubSecretName:
+    Type: String
+    Default: dance-now/dockerhub-credentials
+    Description: >
+      Name of a Secrets Manager secret, created out-of-band, holding
+      {"username": "...", "password": "<docker hub access token>"}.
+      This template only grants read access to it by name; it does not
+      create or store the secret itself.
+
+Resources:
+  SourceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/dance-now-worker-build
+      RetentionInDays: 14
+
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DanceNowCodeBuildLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt SourceLogGroup.Arn
+        - PolicyName: DanceNowCodeBuildSource
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${BucketName}/dance-now/codebuild-source/*
+        - PolicyName: DanceNowDockerHubSecret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DockerHubSecretName}-*
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: dance-now-worker-build
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      TimeoutInMinutes: 60
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Source:
+        Type: S3
+        Location: !Sub ${BucketName}/dance-now/codebuild-source/source.zip
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: DOCKERHUB_USERNAME
+            Value: !Ref DockerHubUsername
+          - Name: DOCKERHUB_REPO
+            Value: !Ref DockerHubRepo
+          - Name: DOCKERHUB_TOKEN
+            Type: SECRETS_MANAGER
+            Value: !Sub ${DockerHubSecretName}:password
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref SourceLogGroup
+
+Outputs:
+  ProjectName:
+    Value: !Ref BuildProject
