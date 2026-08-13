@@ -128,11 +128,16 @@ Resources:
         Type: SPOT
         MinvCpus: 0
         DesiredvCpus: 0
-        MaxvCpus: 8
+        MaxvCpus: 4
         AllocationStrategy: SPOT_PRICE_CAPACITY_OPTIMIZED
         BidPercentage: !Ref SpotBidPercentage
         InstanceTypes:
-          - g5.2xlarge
+          # Same GPU as g5.2xlarge (1x A10G, 24GB VRAM — what actually
+          # matters for Wan inference), just 4 vCPU/16GB RAM instead of
+          # 8/32GB. Chosen to fit a default/unrequested EC2 Spot G/VT quota;
+          # bump both this and MaxvCpus/ResourceRequirements below together
+          # if that quota is raised and more headroom is wanted.
+          - g5.xlarge
         InstanceRole: !GetAtt BatchInstanceProfile.Arn
         SpotIamFleetRole: !GetAtt SpotFleetRole.Arn
         Subnets: !Ref SubnetIds
@@ -174,11 +179,11 @@ Resources:
           - Type: GPU
             Value: "1"
           - Type: VCPU
-            Value: "8"
+            Value: "4"
           - Type: MEMORY
-            Value: "30000"
+            Value: "14000"
         LinuxParameters:
-          SharedMemorySize: 8192
+          SharedMemorySize: 2048
         Environment:
           - Name: MODEL_ID
             Value: Wan-AI/Wan2.2-TI2V-5B

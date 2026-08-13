@@ -11,6 +11,18 @@ phases:
   build:
     commands:
       - docker build --tag "${IMAGE_URI}" .
+      # Smoke test before anything gets published: confirms Python actually
+      # starts, every dependency imports cleanly (torch, the Wan2.2 package,
+      # our own worker.py/dance_now code, boto3, huggingface_hub), and that
+      # the install didn't silently break something. CodeBuild has no GPU,
+      # so this can't confirm CUDA itself works — only that nothing hangs or
+      # crashes on startup, which is the class of failure that's otherwise
+      # invisible until a real (quota-scarce) GPU job mysteriously stalls.
+      - >
+        docker run --rm --entrypoint python "${IMAGE_URI}" -c
+        "import torch, boto3, huggingface_hub, wan, worker;
+        print('torch', torch.__version__, 'cuda_available:', torch.cuda.is_available());
+        print('SMOKE_TEST_OK')"
   post_build:
     commands:
       - docker push "${IMAGE_URI}"

@@ -4,16 +4,20 @@ Generate five-second videos from batches of images using the open Wan 2.2 TI2V-5
 model and a single cost-conscious AWS Batch Spot GPU job.
 
 The default design deliberately processes a whole manifest sequentially on one
-`g5.2xlarge`. Wan is downloaded and loaded once, then reused for every image in
+`g5.xlarge`. Wan is downloaded and loaded once, then reused for every image in
 the batch. The Batch compute environment has zero minimum vCPUs and at most one
 GPU instance, so it scales back down when the work is finished.
 
 ## What gets created
 
-- An ECR image containing the worker and Wan inference code (not the model weights).
-- An AWS Batch Spot compute environment restricted to one `g5.2xlarge`.
+- A worker image containing the Wan inference code (not the model weights),
+  built and published to a Docker Hub repository entirely via AWS CodeBuild —
+  no local machine ever needs to build or upload it (see
+  [Build the worker image](#1-build-the-worker-image) below). ECR is also
+  supported as a local-build alternative.
+- An AWS Batch Spot compute environment restricted to one `g5.xlarge`.
 - A job queue and job definition.
-- IAM roles scoped to the S3 bucket supplied during deployment.
+- IAM roles scoped to a `dance-now/` prefix in the S3 bucket supplied during deployment.
 - A temporary 150 GB encrypted root disk, deleted with the Spot instance.
 
 Model weights are downloaded from Hugging Face at the beginning of each cold
@@ -22,39 +26,80 @@ the generated MP4 files, and JSON metadata live in your existing S3 bucket.
 
 ## Prerequisites
 
-- AWS CLI credentials with permission to use CloudFormation, IAM, ECR, Batch,
-  EC2, and the chosen S3 bucket.
-- Docker with `buildx` available.
+- AWS CLI credentials with permission to use CloudFormation, IAM, CodeBuild,
+  Secrets Manager, Batch, EC2, and the chosen S3 bucket.
+- A Docker Hub account, if using the recommended CodeBuild build path (a free
+  account is enough — see [Build the worker image](#1-build-the-worker-image)).
+  Docker with `buildx` is only needed for the local-build alternative.
 - A VPC and subnet with outbound internet access. A default VPC works.
-- An EC2 Spot quota of at least 8 vCPUs for G/VT instances. New accounts often
-  need a quota request before the first GPU job can start.
+- An EC2 Spot quota for G/VT instances — `g5.xlarge` needs 4 vCPUs of that
+  quota. New accounts often start at 0 and need a one-time increase request
+  (AWS Console → Service Quotas → Amazon EC2 → "All G and VT Spot Instance
+  Requests") before the first GPU job can start; this can take anywhere from
+  minutes to a couple of days for AWS to approve.
 - Python 3.10 or newer for the local submission command.
 
 The scripts use the normal AWS CLI region resolution. On this machine that is
 currently `eu-west-2`. Set `AWS_REGION` if the bucket and GPU resources should
 be somewhere else.
 
-## 1. Build and push the worker
+## 1. Build the worker image
 
-From the repository root:
+The image (CUDA + PyTorch + Wan2.2 + this project's worker script) is
+several GB — building and uploading it from a laptop can take hours on a
+slow or metered connection, and never needs to happen more than once per
+code change. **Recommended: build it entirely inside AWS via CodeBuild**,
+which pushes to a Docker Hub repository you own; your own connection only
+ever carries the source code (tens of KB), never the image itself.
+
+One-time setup, after creating a Docker Hub [access token](https://hub.docker.com/settings/security)
+scoped to "Read & Write" (not your password):
 
 ```bash
+aws secretsmanager create-secret \
+  --name dance-now/dockerhub-credentials \
+  --secret-string '{"username":"YOUR_DOCKERHUB_USER","password":"YOUR_ACCESS_TOKEN"}' \
+  --region YOUR_REGION
+
 chmod +x scripts/*.sh
+./scripts/deploy_codebuild.sh dance-now-codebuild YOUR_BUCKET YOUR_DOCKERHUB_USER
+```
+
+Then, whenever the image needs (re)building:
+
+```bash
+./scripts/build_via_codebuild.sh dance-now-worker-build YOUR_BUCKET
+```
+
+This builds, smoke-tests (confirms Python/CUDA/Wan/worker imports cleanly
+before anything is published), and pushes the image, then prints it pinned
+by content digest, e.g. `YOUR_DOCKERHUB_USER/dance-now-worker@sha256:...` —
+pin to that exact digest rather than the mutable `latest` tag, so a later
+push can't silently change what you're running. Use that value as
+`ContainerImage` / `--image-uri` in the steps below.
+
+<details>
+<summary>Alternative: build locally and push to ECR</summary>
+
+If you have fast, unmetered bandwidth and would rather not use Docker Hub:
+
+```bash
 ./scripts/build_and_push.sh dance-now-worker v1
 ```
 
-The last output line is the ECR image URI. The first build is large and may take
-a while because it contains CUDA, PyTorch, and Wan's dependencies.
+The last output line is the ECR image URI. The first build is large and may
+take a while because it contains CUDA, PyTorch, and Wan's dependencies.
+</details>
 
 ## 2. Deploy the Batch stack
 
-Find a VPC and suitable subnet IDs, then deploy:
+Find a VPC and suitable subnet IDs, then deploy, using the image URI from step 1:
 
 ```bash
 ./scripts/deploy_stack.sh \
   dance-now \
   YOUR_BUCKET \
-  ACCOUNT.dkr.ecr.REGION.amazonaws.com/dance-now-worker:v1 \
+  YOUR_DOCKERHUB_USER/dance-now-worker@sha256:... \
   vpc-0123456789abcdef0 \
   subnet-0123456789abcdef0,subnet-0123456789abcdef1
 ```
@@ -138,13 +183,18 @@ your account when it exits, including on Ctrl-C or a failed build.
   --vpc vpc-0123456789abcdef0 \
   --subnets subnet-0123456789abcdef0,subnet-0123456789abcdef1 \
   --input-dir ./images \
-  --prompt "The dancer moves naturally while the camera slowly pushes in"
+  --prompt "The dancer moves naturally while the camera slowly pushes in" \
+  --image-uri YOUR_DOCKERHUB_USER/dance-now-worker@sha256:...
 ```
 
 Requires the venv from step 3 to be active (`dance-now-submit` on `PATH`).
 Run `./scripts/run_job.sh --help` for the full option list, including
 `--s3-input-prefix`, `--seed`, `--seconds`, `--video-size`, `--job-name`, and
 `--poll-seconds`.
+
+Pass `--codebuild-project dance-now-worker-build` instead of `--image-uri` to
+have it build fresh via CodeBuild first (see step 1) — useful when iterating
+on the Dockerfile/worker code itself; skip both to build locally into ECR.
 
 On success it also downloads the resulting `.mp4`/`.json` pair from S3 into
 `videos/<job-name>/` (a sibling of `images/`) so you don't have to go fetch
@@ -154,13 +204,14 @@ objects once the local download is confirmed — the bucket itself is never
 deleted, so `--bucket` can safely point at a fixed bucket you keep around
 permanently rather than a throwaway one.
 
-By default it also deletes the ECR repository/image on exit, so a rerun
-rebuilds the multi-GB CUDA image from scratch — safe, but slow. If you'll run
-more jobs within the ECR image's monthly storage cost (a few cents to ~$1),
-pass `--keep-image` to skip the rebuild next time; pass `--image-uri` on a
-later run to reuse it without rebuilding. `--keep-stack` similarly skips
-deleting the CloudFormation stack (Batch scales it to zero vCPUs between
-jobs, so leaving it costs nothing but the IAM/queue bookkeeping).
+With `--image-uri` (a Docker Hub image, as recommended), the image is never
+deleted on exit — that's the point of publishing it once and reusing it.
+With a local ECR build, by default it deletes the ECR repository/image on
+exit instead, so a rerun rebuilds the multi-GB CUDA image from scratch —
+safe, but slow; pass `--keep-image` to skip that rebuild next time.
+`--keep-stack` similarly skips deleting the CloudFormation stack (Batch
+scales it to zero vCPUs between jobs, so leaving it costs nothing but the
+IAM/queue bookkeeping).
 
 ## Monitor a job
 
@@ -175,7 +226,7 @@ files that were already completed, avoiding duplicate inference.
 ## Cost controls
 
 - `MinvCpus: 0` prevents an always-on GPU.
-- `MaxvCpus: 8` permits only one `g5.2xlarge` at a time.
+- `MaxvCpus: 4` permits only one `g5.xlarge` at a time.
 - One job handles all images sequentially and loads the model once.
 - The model disk is deleted when the instance terminates.
 - Existing output files are skipped during retries.
